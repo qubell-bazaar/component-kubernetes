@@ -1,0 +1,519 @@
+application:
+  configuration:
+    configuration.operating-system: { "image": "us-east-1/ami-68bdc102", "identity": "core" }
+    configuration.memberTargetQuantity: 3
+    configuration.hardwareId-member: "m1.small"
+    configuration.kube-api-port: 8080
+    configuration.version: "v1.1.1"
+  interfaces:
+    configuration:
+      hardwareId-member: bind(workflow#input.hardwareId-member)
+      operating-system: bind(workflow#input.operating-system)
+      memberTargetQuantity: bind(workflow#input.memberTargetQuantity)
+      kube-api-port:  bind(workflow#input.kube-api-port)
+      version:  bind(workflow#input.version)
+    kubernetes:
+       kube-ui: bind(workflow#result.kube-ui)
+       master-ip: bind(workflow#result.master-ip)
+       member-ips: bind(workflow#result.member-ips)
+       member-private: bind(workflow#result.member-private)
+
+  components:
+    workflow:
+      type: workflow.Instance
+      interfaces:
+        input:
+          hardwareId-member:
+            type: configuration(string)
+            name: member Amazon image size
+          memberTargetQuantity: 
+            type: configuration(int)
+            name: member numbers
+          operating-system: 
+             type: configuration(map<string,object>)
+             name: Compatible image
+             suggestions:
+                  "Ubuntu 14.04 [us-east]": { "image": "us-east-1/ami-68bdc102", "identity": "core" }
+          kube-api-port:
+             type: configuration(int)
+             name: Kubernetes apiserver port
+          version:
+             type: configuration(string)
+             name: Kubernetes release version
+        actions:
+          kube-entity: 
+             type: receive-command(string action, list<string> uris => string execout)
+             arguments:
+              action:
+                name: "Resource Action"
+                suggestions:
+                  Delete: "delete"
+                  Create: "create"
+                  Update: "update"
+              uris:
+                name: "Urls to Resources manifests"
+                default: "[]"
+                
+        result:
+          master-ip: publish-signal(string)
+          master-private-ip: publish-signal(string)
+          member-ips: publish-signal(list<string>)
+          member-private: publish-signal(list<string>)
+          clean-result: publish-signal(string)
+          kube-ui: publish-signal(string)
+      configuration:
+        configuration.triggers: 
+          input.memberTargetQuantity: scale
+        configuration.propagateStatus:  
+          - scale
+        configuration.workflows:
+          launch: &update
+            steps:
+              - provision-first-node:
+                    action: provisionVms
+                    parameters:
+                      connectTimeout: 20 minutes
+                      hardwareId: "{$.hardwareId-member}"
+                      imageId: "{$.operating-system.image}"
+                      targetQuantity: 1
+                      vmIdentity: "{$.operating-system.identity}"
+                      roleName: master
+                      providerSettings:
+                        userData:
+                            |
+                            #cloud-config
+                            write-files:
+                              - path: /opt/bin/wupiao
+                                permissions: '0755'
+                                content: |
+                                  #!/bin/bash
+                                  # [w]ait [u]ntil [p]ort [i]s [a]ctually [o]pen
+                                  [ -n "$$1" ] && [ -n "$$2" ] && while ! curl --output /dev/null \
+                                    --silent --head --fail \
+                                    http://$${{1}}:$${{2}}/v2/machines; do sleep 1 && echo -n .; done;
+                                  exit $$?
+                            coreos:
+                              update:
+                                reboot-strategy: etcd-lock
+                              etcd2:
+                                name: master
+                                advertise-client-urls: "http://$$public_ipv4:2379"
+                                initial-advertise-peer-urls: "http://$$private_ipv4:2380"
+                                listen-client-urls: "http://0.0.0.0:2379,http://0.0.0.0:4001"
+                                listen-peer-urls: "http://$$private_ipv4:2380,http://$$private_ipv4:7001"
+                                initial-cluster: master=http://$$private_ipv4:2380
+                                initial-cluster-token: k8s_etcd
+                                initial-cluster-state: new
+                              fleet:
+                                public-ip: $$private_ipv4
+                                metadata: role=master,public_ip=$$public_ipv4,region=us-east-1,instance-type=m1.small
+                              units:
+                                - name: generate-serviceaccount-key.service
+                                  command: start
+                                  content: |
+                                    [Unit]
+                                    Description=Generate service-account key file
+                            
+                                    [Service]
+                                    ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+                                    ExecStart=/bin/openssl genrsa -out /opt/bin/kube-serviceaccount.key 2048 2>/dev/null
+                                    RemainAfterExit=yes
+                                    Type=oneshot
+                                - name: setup-network-environment.service
+                                  command: start
+                                  content: |
+                                    [Unit]
+                                    Description=Setup Network Environment
+                                    Documentation=https://github.com/kelseyhightower/setup-network-environment
+                                    Requires=network-online.target
+                                    After=network-online.target
+                            
+                                    [Service]
+                                    ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+                                    ExecStartPre=/usr/bin/curl -L -o /opt/bin/setup-network-environment -z /opt/bin/setup-network-environment https://github.com/kelseyhightower/setup-network-environment/releases/download/v1.0.0/setup-network-environment
+                                    ExecStartPre=/usr/bin/chmod +x /opt/bin/setup-network-environment
+                                    ExecStart=/opt/bin/setup-network-environment
+                                    RemainAfterExit=yes
+                                    Type=oneshot
+                                - name: etcd2.service
+                                  command: start
+                                - name: fleet.service
+                                  command: start
+                                - name: flanneld.service
+                                  drop-ins:
+                                    - name: 50-network-config.conf
+                                      content: |
+                                        [Unit]
+                                        Requires=etcd2.service
+                                        [Service]
+                                        ExecStartPre=/usr/bin/etcdctl set /coreos.com/network/config '{{"Network":"10.244.0.0/16", "Backend": {{"Type": "vxlan"}}}}'
+                                  command: start
+                                - name: docker.service
+                                  command: start
+                                - name: kube-apiserver.service
+                                  command: start
+                                  content: |
+                                    [Unit]
+                                    Description=Kubernetes API Server
+                                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                                    Requires=setup-network-environment.service etcd2.service generate-serviceaccount-key.service
+                                    After=setup-network-environment.service etcd2.service generate-serviceaccount-key.service
+                            
+                                    [Service]
+                                    EnvironmentFile=/etc/network-environment
+                                    ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+                                    ExecStartPre=/usr/bin/curl -o /opt/bin/kubectl  https://storage.googleapis.com/kubernetes-release/release/v1.1.1/bin/linux/amd64/kubectl
+                                    ExecStartPre=/usr/bin/chmod +x /opt/bin/kubectl
+                                    ExecStartPre=/usr/bin/curl -L -o /opt/bin/kube-apiserver -z /opt/bin/kube-apiserver https://storage.googleapis.com/kubernetes-release/release/{$.version}/bin/linux/amd64/kube-apiserver
+                                    ExecStartPre=/usr/bin/chmod +x /opt/bin/kube-apiserver
+                                    ExecStartPre=/opt/bin/wupiao 127.0.0.1 2379
+                                    ExecStart=/opt/bin/kube-apiserver \
+                                    --service_account_key_file=/opt/bin/kube-serviceaccount.key \
+                                    --service_account_lookup=false \
+                                    --admission_control=NamespaceLifecycle,NamespaceAutoProvision,LimitRanger,SecurityContextDeny,ServiceAccount,ResourceQuota \
+                                    --runtime_config=api/v1 \
+                                    --allow_privileged=true \
+                                    --insecure_bind_address=0.0.0.0 \
+                                    --insecure_port={$.kube-api-port} \
+                                    --kubelet_https=true \
+                                    --secure_port=6443 \
+                                    --service-cluster-ip-range=10.10.0.0/16 \
+                                    --etcd_servers=http://127.0.0.1:2379 \
+                                    --public_address_override=$${{DEFAULT_IPV4}} \
+                                    --logtostderr=true
+                                    Restart=always
+                                    RestartSec=10
+                                - name: kube-controller-manager.service
+                                  command: start
+                                  content: |
+                                    [Unit]
+                                    Description=Kubernetes Controller Manager
+                                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                                    Requires=kube-apiserver.service
+                                    After=kube-apiserver.service
+                            
+                                    [Service]
+                                    ExecStartPre=/usr/bin/curl -L -o /opt/bin/kube-controller-manager -z /opt/bin/kube-controller-manager https://storage.googleapis.com/kubernetes-release/release/{$.version}/bin/linux/amd64/kube-controller-manager
+                                    ExecStartPre=/usr/bin/chmod +x /opt/bin/kube-controller-manager
+                                    ExecStart=/opt/bin/kube-controller-manager \
+                                    --service_account_private_key_file=/opt/bin/kube-serviceaccount.key \
+                                    --master=127.0.0.1:{$.kube-api-port} \
+                                    --logtostderr=true
+                                    Restart=always
+                                    RestartSec=10
+                                - name: kube-scheduler.service
+                                  command: start
+                                  content: |
+                                    [Unit]
+                                    Description=Kubernetes Scheduler
+                                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                                    Requires=kube-apiserver.service
+                                    After=kube-apiserver.service
+                            
+                                    [Service]
+                                    ExecStartPre=/usr/bin/curl -L -o /opt/bin/kube-scheduler -z /opt/bin/kube-scheduler https://storage.googleapis.com/kubernetes-release/release/{$.version}/bin/linux/amd64/kube-scheduler
+                                    ExecStartPre=/usr/bin/chmod +x /opt/bin/kube-scheduler
+                                    ExecStart=/opt/bin/kube-scheduler --master=127.0.0.1:{$.kube-api-port}
+                                    Restart=always
+                                    RestartSec=10
+                    output:
+                      master-ips: ips
+                      master-private-ips: privateips              
+              - provision-nodes:
+                    action: provisionVms
+                    precedingPhases: [ provision-first-node ]
+                    parameters:
+                      connectTimeout: 20 minutes
+                      hardwareId: "{$.hardwareId-member}"
+                      imageId: "{$.operating-system.image}"
+                      targetQuantity: "{$.memberTargetQuantity}"
+                      vmIdentity: "{$.operating-system.identity}"
+                      roleName: slaves
+                      providerSettings:
+                        userData:
+                            |
+                            #cloud-config
+                            write-files:
+                              - path: /opt/bin/wupiao
+                                permissions: '0755'
+                                content: |
+                                  #!/bin/bash
+                                  # [w]ait [u]ntil [p]ort [i]s [a]ctually [o]pen
+                                  [ -n "$$1" ] && [ -n "$$2" ] && while ! curl --output /dev/null \
+                                    --silent --head --fail \
+                                    http://$${{1}}:$${{2}}; do sleep 1 && echo -n .; done;
+                                  exit $$?
+                            coreos:
+                              etcd2:
+                                listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+                                advertise-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+                                initial-cluster: master=http://{$.master-private-ips[0]}:2380
+                                proxy: on
+                              fleet:
+                                public-ip: $$private_ipv4
+                                metadata: role=node,public_ip=$$public_ipv4,region=us-east-1,instance-type=m1.small
+                              units:
+                                - name: etcd2.service
+                                  command: start
+                                - name: fleet.service
+                                  command: start
+                                - name: flanneld.service
+                                  command: start
+                                  drop-ins:
+                                    - name: 50-network-config.conf
+                                      content: |
+                                        [Unit]
+                                        Requires=etcd2.service
+                                        [Service]
+                                        ExecStartPre=/usr/bin/etcdctl set /coreos.com/network/config '{{"Network":"10.244.0.0/16", "Backend": {{"Type": "vxlan"}}}}'
+                                - name: docker.service
+                                  command: start
+                                - name: setup-network-environment.service
+                                  command: start
+                                  content: |
+                                    [Unit]
+                                    Description=Setup Network Environment
+                                    Documentation=https://github.com/kelseyhightower/setup-network-environment
+                                    Requires=network-online.target
+                                    After=network-online.target
+                            
+                                    [Service]
+                                    ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+                                    ExecStartPre=/usr/bin/curl -L -o /opt/bin/setup-network-environment -z /opt/bin/setup-network-environment https://github.com/kelseyhightower/setup-network-environment/releases/download/v1.0.0/setup-network-environment
+                                    ExecStartPre=/usr/bin/chmod +x /opt/bin/setup-network-environment
+                                    ExecStart=/opt/bin/setup-network-environment
+                                    RemainAfterExit=yes
+                                    Type=oneshot
+                                - name: kube-proxy.service
+                                  command: start
+                                  content: |
+                                    [Unit]
+                                    Description=Kubernetes Proxy
+                                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                                    Requires=setup-network-environment.service
+                                    After=setup-network-environment.service
+                            
+                                    [Service]
+                                    ExecStartPre=/usr/bin/curl -L -o /opt/bin/kube-proxy -z /opt/bin/kube-proxy https://storage.googleapis.com/kubernetes-release/release/{$.version}/bin/linux/amd64/kube-proxy
+                                    ExecStartPre=/usr/bin/chmod +x /opt/bin/kube-proxy
+                                    # wait for kubernetes master to be up and ready
+                                    ExecStartPre=/opt/bin/wupiao {$.master-private-ips[0]} {$.kube-api-port}
+                                    ExecStart=/opt/bin/kube-proxy \
+                                    --master={$.master-private-ips[0]}:{$.kube-api-port} \
+                                    --logtostderr=true
+                                    Restart=always
+                                    RestartSec=10
+                                - name: kube-kubelet.service
+                                  command: start
+                                  content: |
+                                    [Unit]
+                                    Description=Kubernetes Kubelet
+                                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                                    Requires=setup-network-environment.service
+                                    After=setup-network-environment.service
+                            
+                                    [Service]
+                                    EnvironmentFile=/etc/network-environment
+                                    ExecStartPre=/usr/bin/curl -L -o /opt/bin/kubelet -z /opt/bin/kubelet https://storage.googleapis.com/kubernetes-release/release/{$.version}/bin/linux/amd64/kubelet
+                                    ExecStartPre=/usr/bin/chmod +x /opt/bin/kubelet
+                                    # wait for kubernetes master to be up and ready
+                                    ExecStartPre=/opt/bin/wupiao {$.master-private-ips[0]} {$.kube-api-port}
+                                    ExecStart=/opt/bin/kubelet \
+                                    --address=0.0.0.0 \
+                                    --port=10250 \
+                                    --hostname_override=$${{DEFAULT_IPV4}} \
+                                    --api_servers={$.master-private-ips[0]}:{$.kube-api-port} \
+                                    --allow_privileged=true \
+                                    --logtostderr=true \
+                                    --cadvisor_port=4194 \
+                                    --healthz_bind_address=0.0.0.0 \
+                                    --healthz_port=10248
+                                    Restart=always
+                                    RestartSec=10
+                              update:
+                                group: alpha
+                                reboot-strategy: off
+                    output:
+                      memberIPs: ips
+                      memberprIPs: privateips
+            return:
+              master-ip: 
+                value: "{$.master-ips[0]}"
+              master-private-ip:
+                value: "{$.master-private-ips[0]}"
+              member-ips:
+                value: "{$.memberIPs}"
+              member-private:
+                value: "{$.memberprIPs}"
+              clean-result: 
+                value: ""
+              kube-ui:
+                value: "http://{$.master-ips[0]}:{$.kube-api-port}/ui"
+          scale:
+            parameters:
+              - memberTargetQuantity:
+                  description: Signals Java opts
+              - destroy_count:
+                  description: member numbers for destroy
+              - destroy_ips:
+                  description: member ips for destroy
+            steps:
+              - provision-nodes:
+                    action: provisionVms
+                    parameters:
+                      connectTimeout: 20 minutes
+                      hardwareId: "{$.hardwareId-member}"
+                      imageId: "{$.operating-system.image}"
+                      targetQuantity: "{$.memberTargetQuantity}"
+                      vmIdentity: "{$.operating-system.identity}"
+                      roleName: slaves
+                      providerSettings:
+                        userData:
+                            |
+                            #cloud-config
+                            write-files:
+                              - path: /opt/bin/wupiao
+                                permissions: '0755'
+                                content: |
+                                  #!/bin/bash
+                                  # [w]ait [u]ntil [p]ort [i]s [a]ctually [o]pen
+                                  [ -n "$$1" ] && [ -n "$$2" ] && while ! curl --output /dev/null \
+                                    --silent --head --fail \
+                                    http://$${{1}}:$${{2}}; do sleep 1 && echo -n .; done;
+                                  exit $$?
+                            coreos:
+                              etcd2:
+                                listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+                                advertise-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+                                initial-cluster: master=http://{$.master-private-ip}:2380
+                                proxy: on
+                              fleet:
+                                public-ip: $$private_ipv4
+                                metadata: role=node,public_ip=$$public_ipv4,region=us-east-1,instance-type=m1.small
+                              units:
+                                - name: etcd2.service
+                                  command: start
+                                - name: fleet.service
+                                  command: start
+                                - name: flanneld.service
+                                  command: start
+                                  drop-ins:
+                                    - name: 50-network-config.conf
+                                      content: |
+                                        [Unit]
+                                        Requires=etcd2.service
+                                        [Service]
+                                        ExecStartPre=/usr/bin/etcdctl set /coreos.com/network/config '{{"Network":"10.244.0.0/16", "Backend": {{"Type": "vxlan"}}}}'
+                                - name: docker.service
+                                  command: start
+                                - name: setup-network-environment.service
+                                  command: start
+                                  content: |
+                                    [Unit]
+                                    Description=Setup Network Environment
+                                    Documentation=https://github.com/kelseyhightower/setup-network-environment
+                                    Requires=network-online.target
+                                    After=network-online.target
+                            
+                                    [Service]
+                                    ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+                                    ExecStartPre=/usr/bin/curl -L -o /opt/bin/setup-network-environment -z /opt/bin/setup-network-environment https://github.com/kelseyhightower/setup-network-environment/releases/download/v1.0.0/setup-network-environment
+                                    ExecStartPre=/usr/bin/chmod +x /opt/bin/setup-network-environment
+                                    ExecStart=/opt/bin/setup-network-environment
+                                    RemainAfterExit=yes
+                                    Type=oneshot
+                                - name: kube-proxy.service
+                                  command: start
+                                  content: |
+                                    [Unit]
+                                    Description=Kubernetes Proxy
+                                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                                    Requires=setup-network-environment.service
+                                    After=setup-network-environment.service
+                            
+                                    [Service]
+                                    ExecStartPre=/usr/bin/curl -L -o /opt/bin/kube-proxy -z /opt/bin/kube-proxy https://storage.googleapis.com/kubernetes-release/release/{$.version}/bin/linux/amd64/kube-proxy
+                                    ExecStartPre=/usr/bin/chmod +x /opt/bin/kube-proxy
+                                    # wait for kubernetes master to be up and ready
+                                    ExecStartPre=/opt/bin/wupiao {$.master-private-ip} {$.kube-api-port}
+                                    ExecStart=/opt/bin/kube-proxy \
+                                    --master={$.master-private-ip}:{$.kube-api-port} \
+                                    --logtostderr=true
+                                    Restart=always
+                                    RestartSec=10
+                                - name: kube-kubelet.service
+                                  command: start
+                                  content: |
+                                    [Unit]
+                                    Description=Kubernetes Kubelet
+                                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                                    Requires=setup-network-environment.service
+                                    After=setup-network-environment.service
+                            
+                                    [Service]
+                                    EnvironmentFile=/etc/network-environment
+                                    ExecStartPre=/usr/bin/curl -L -o /opt/bin/kubelet -z /opt/bin/kubelet https://storage.googleapis.com/kubernetes-release/release/{$.version}/bin/linux/amd64/kubelet
+                                    ExecStartPre=/usr/bin/chmod +x /opt/bin/kubelet
+                                    # wait for kubernetes master to be up and ready
+                                    ExecStartPre=/opt/bin/wupiao {$.master-private-ip} {$.kube-api-port}
+                                    ExecStart=/opt/bin/kubelet \
+                                    --address=0.0.0.0 \
+                                    --port=10250 \
+                                    --hostname_override=$${{DEFAULT_IPV4}} \
+                                    --api_servers={$.master-private-ip}:{$.kube-api-port} \
+                                    --allow_privileged=true \
+                                    --logtostderr=true \
+                                    --cadvisor_port=4194 \
+                                    --healthz_bind_address=0.0.0.0 \
+                                    --healthz_port=10248
+                                    Restart=always
+                                    RestartSec=10
+                              update:
+                                group: alpha
+                                reboot-strategy: off
+                    output:
+                      memberIPs: ips
+                      memberprIPs: privateips
+              - remove-deleted-nodes-from-kube-api:
+                  action: execrun
+                  precedingPhases: [ provision-nodes ]
+                  parameters:
+                      roles: [ master ]
+                      command:
+                          - |
+                            sudo /opt/bin/kubectl -s 127.0.0.1:8080 get nodes |grep NotReady |awk '{print $1}'|xargs sudo /opt/bin/kubectl -s 127.0.0.1:8080 delete node;
+                  output:
+                      clean-result: stdout
+                  
+            return:
+              clean-result:
+                value: "{$.clean-result[*][0]}"
+              member-ips:
+                value: "{$.memberIPs}"
+              member-private:
+                value: "{$.memberprIPs}"
+          
+          kube-entity:
+            steps:
+              - serialize:
+                  action: serialize
+                  parameters:
+                    format: CSV
+                    input:
+                      - "{$.uris}"
+                  output:
+                    out: serialized
+              - run-entity-action:
+                  action: execrun
+                  precedingPhases: [ serialize ]
+                  parameters:
+                      isSudo: true
+                      roles: [ master ]
+                      command:
+                          - |
+                             /opt/bin/kubectl -s 127.0.0.1:8080 {$.action} -f {$.out}
+                  output:
+                      execout: stdout
+            return:
+              execout:
+                value: "{$.execout[*][0]}"
