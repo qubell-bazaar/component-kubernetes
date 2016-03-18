@@ -5,7 +5,7 @@ Install and configure Kubernetes on CoreOS cluster.
 Version 1.0-43p
 -------------
 
-[![Install](https://raw.github.com/qubell-bazaar/component-skeleton/master/img/install.png)](https://express.qubell.com/applications/upload?metadataUrl=https://raw.github.com/qubell-bazaar/component-kubernetes/1.0-43p/meta.yml)
+[![Install](https://raw.github.com/qubell-bazaar/component-skeleton/master/img/install.png)](https://express.tonomi.com/applications/upload?metadataUrl=https://raw.github.com/qubell-bazaar/component-kubernetes/1.0-43p/meta.yml)
 
 Attributes
 ----------
